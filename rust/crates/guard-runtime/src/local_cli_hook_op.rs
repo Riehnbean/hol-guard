@@ -9,7 +9,9 @@
 //!
 //! A failed or malformed identity derivation records nothing. A grant step
 //! without a trustworthy answer is unverified: an allowed command is held for
-//! review while any block rule exists, as `unverified_local_cli_action` does.
+//! review while any block rule exists. A hook that gets no answer from this op
+//! at all answers with the host outage response, as the direct hook path's
+//! unverified block does; the transport never picks an action itself.
 
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,6 +69,7 @@ pub(crate) fn evaluate_local_cli_hook_request(
             }
             if let Some(grant) = refined.contained_grant {
                 payload["contained_grant"] = grant;
+                payload["contained_route"] = crate::local_cli_hook_contained::contained_route();
             }
             ("ok".to_owned(), "ok".to_owned(), Some(payload))
         }
@@ -117,6 +120,7 @@ pub(crate) fn run_refined(request: &LocalCliHookRequestV1) -> Result<Refined, &'
 
 /// The grant refinement alone, recording nothing: what the workspace sink
 /// asks again right before it widens a sandbox by a grant.
+#[cfg(unix)]
 pub(crate) fn decide_refined(request: &LocalCliHookRequestV1) -> Result<Refined, &'static str> {
     let package = checked_package(request)?;
     Ok(refined(request, &package))

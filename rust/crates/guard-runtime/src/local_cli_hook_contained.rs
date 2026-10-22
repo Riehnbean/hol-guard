@@ -1,7 +1,9 @@
 //! How a local CLI grant refines the hook action.
 //!
-//! A generic review, `warn` or `require-reapproval` follows the grant as
-//! before: allowed to `allow`, blocked to `block`. A command the workspace
+//! `warn` and the generic review due to non-recognition follow the grant:
+//! allowed to `allow`, blocked to `block`. Any other review or
+//! `require-reapproval` carries a risk signal of its own, so a block still
+//! applies but an allow leaves it standing. A command the workspace
 //! sandbox bounds (`sandbox-required`), or a review left only because the
 //! program lives outside the sandbox's executable roots, never leaves the
 //! sandbox on a grant: an allowed CLI widens the sandbox by the grant's
@@ -22,6 +24,15 @@ pub(crate) const ALLOW_CONTAINED_WITH_GRANT: &str = "allow-contained-with-grant"
 /// program; `guard_command::pretool::workspace_contained::OUTSIDE_ROOTS_REASON`.
 pub(crate) const OUTSIDE_ROOTS_REASON: &str =
     "native_workspace_containment_executable_outside_roots";
+/// The reason code a sandbox-bound command the grant widens is routed to;
+/// `guard_command::pretool::workspace_contained::WORKSPACE_REASON`.
+pub(crate) const WORKSPACE_REASON: &str = "native_workspace_containment_required";
+/// The sentence that names the grant as the only widening of the sandbox.
+pub(crate) const GRANT_REASON: &str = concat!(
+    "HOL Guard runs this command in a protected workspace sandbox, widened only by the ",
+    "local CLI access you approved on this device."
+);
+
 /// Every capability a grant may turn on, in their canonical order.
 pub(crate) const GRANT_CAPABILITIES: [&str; 3] =
     ["loopback-network", "state-dir-read", "state-dir-write"];
@@ -58,6 +69,15 @@ pub(crate) fn sandbox_bound(request: &LocalCliHookRequestV1) -> bool {
     }
 }
 
+/// Whether an allowed grant lifts this unbounded action to `allow`: `allow`
+/// and `warn` already run, and a review must be due to non-recognition alone.
+fn lifts(request: &LocalCliHookRequestV1) -> bool {
+    match request.current_action.as_str() {
+        "allow" | "warn" => true,
+        _ => crate::connector_setup::grant_lifts(request.current_reason_code.as_deref()),
+    }
+}
+
 /// Whether a grant may refine the action at all.
 pub(crate) fn refinable(request: &LocalCliHookRequestV1) -> bool {
     request.grant_allowed
@@ -78,10 +98,12 @@ pub(crate) fn refine(
             action: "block".to_owned(),
             ..Refined::default()
         },
-        Ok((Some("allowed"), _, _)) if !bound => Refined {
+        Ok((Some("allowed"), _, _)) if !bound && lifts(request) => Refined {
             action: "allow".to_owned(),
             ..Refined::default()
         },
+        // A review with its own risk signal outlives the grant.
+        Ok((Some("allowed"), _, _)) if !bound => Refined::keep(request),
         Ok((Some("allowed"), Some(launch), capabilities)) => {
             match grant_capabilities(&capabilities) {
                 Ok(capabilities) => Refined {
@@ -110,6 +132,21 @@ pub(crate) fn refine(
     }
 }
 
+/// The review fields a granted outside-roots command is routed to.
+///
+/// The caller owns no part of this verdict: it narrows the review it holds to
+/// the surfaces this operation reads, and copies the answer back. A caller
+/// that cannot reach the resident keeps its review.
+pub(crate) fn contained_route() -> Value {
+    json!({
+        "decision": "deny",
+        "minimum_action": "sandbox-required",
+        "policy_action": "sandbox-required",
+        "reason_code": WORKSPACE_REASON,
+        "reason": GRANT_REASON,
+    })
+}
+
 /// The decision's capability names: absent is none; anything but a sorted,
 /// distinct list of known names is untrusted.
 pub(crate) fn grant_capabilities(value: &Value) -> Result<Vec<String>, ()> {
@@ -133,8 +170,8 @@ pub(crate) fn grant_capabilities(value: &Value) -> Result<Vec<String>, ()> {
     Ok(names)
 }
 
-/// `unverified_local_cli_action`: hold an otherwise allowed command for
-/// review while a block rule might apply.
+/// A grant the resident could not verify: hold an otherwise allowed command
+/// for review while a block rule might apply.
 pub(crate) fn unverified_action(request: &LocalCliHookRequestV1) -> &str {
     let current = request.current_action.as_str();
     if !matches!(current, "allow" | "warn") {

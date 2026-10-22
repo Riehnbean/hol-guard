@@ -160,6 +160,12 @@ def _run_guard_approvals_command(
 ) -> int:
     store = _require_guard_store(store)
     approvals_command = getattr(args, "approvals_command", None)
+    if approvals_command == "wait":
+        from .approval_wait import run_approval_wait_command
+
+        payload, exit_code = run_approval_wait_command(args, store=store)
+        _emit("approvals", payload, getattr(args, "json", False))
+        return exit_code
     if approvals_command == "open":
         payload, exit_code = run_approval_open_command(args, store=store)
         _emit("approvals", payload, getattr(args, "json", False))
@@ -402,7 +408,7 @@ def _run_guard_doctor_command(
         )
         native_runtime_repair = repair[0] if repair is not None else None
     with nullcontext() if args.harness else without_command_probes():
-        availability = doctor_native_availability()
+        availability = doctor_native_availability(guard_home)
     native_runtime: dict[str, object] = {
         "availability": availability,
         "admission": native_resident_admission_snapshot(),

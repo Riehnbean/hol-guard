@@ -165,6 +165,20 @@ fn verdict(
                 .filter(|executable| super::executable_basename(executable) == "git")
                 .filter(|_| !patch_check(&arguments[index], read_context))
                 .and_then(|executable| {
+                    // Git dies in its own setup on a `-C` target that holds
+                    // no repository, before it reads a pager, textconv or
+                    // filter setting, so no configured helper runs. The
+                    // probe cannot answer for that read either: there is no
+                    // repository configuration to read, and the directory
+                    // may not be there to probe in at all. Operations that
+                    // keep running without a repository, and inline `-c`
+                    // settings, are not such a route and stay probed.
+                    if super::git_helper_context::routes_to_no_repository(
+                        segments[index],
+                        read_context,
+                    ) {
+                        return Some(true);
+                    }
                     super::git_config::execution_free(
                         executable,
                         &arguments[index],
@@ -195,11 +209,23 @@ fn verdict(
     };
     // A proven Git read, `origin` fetch or worktree add writes no
     // configuration, so it cannot change what a later read in the same
-    // command would run.
+    // command would run. A proven dependency link settles only Git reads
+    // that run no configured helper whatever the configuration holds: the
+    // link can make a configuration include, or a `-C` route, reachable that
+    // the probe never read.
+    let link_settles = segments.iter().all(|segment| {
+        segment
+            .executable
+            .as_deref()
+            .is_none_or(|executable| super::executable_basename(executable) != "git")
+            || super::symlink_writes::current_branch_read(segment, read_context)
+    });
     let settled = |prior: usize| {
         let segment = segments[prior];
         benign.contains(&prior)
             || write_free(segment)
+            || (link_settles
+                && super::symlink_writes::safe_symlink_arguments(segment, read_context))
             || super::git_remote_ops::verified_fetch(segment, read_context)
             || super::git_remote_ops::verified_fetch(segment, context)
             || super::worktree_add::proven_alone(
@@ -399,6 +425,7 @@ fn may_inspect(arguments: &[String]) -> bool {
                         | "show-ref"
                         | "for-each-ref"
                         | "rev-list"
+                        | "stash"
                 )
             }
         }

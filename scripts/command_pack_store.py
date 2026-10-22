@@ -1,87 +1,26 @@
-"""Bounded build-object integrity checks and atomic immutable writes.
+"""Build-time pack object reader.
 
-These helpers establish byte integrity only. Authenticated release authority
-and native policy admission are separate requirements.
+Publishing, regeneration and pack builds run without the native runtime
+installed, so they read and verify pack objects here. The installed runtime
+checks the same references natively.
 """
-
-from __future__ import annotations
 
 import hashlib
 import json
-import os
-import stat
-import tempfile
-from pathlib import Path
+from typing import Any
 
-MAX_OBJECT_BYTES = 64 * 1024
-MAX_BLOB_BYTES = 8 * 1024 * 1024
-
-
-def digest(value) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
-
-
-def read_object(path: Path) -> bytes:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
-    with os.fdopen(descriptor, "rb") as stream:
-        metadata = os.fstat(stream.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= MAX_OBJECT_BYTES:
-            raise ValueError("pack cache object type or length invalid")
-        return stream.read(MAX_OBJECT_BYTES + 1)
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import MAX_BLOB_BYTES as MAX_BLOB_BYTES
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import MAX_OBJECT_BYTES as MAX_OBJECT_BYTES
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import PackReader as NativePackReader
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import decode as decode
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import digest as digest
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import durable_directory as durable_directory
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import publish_object as publish_object
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import read_object as read_object
 
 
-def durable_directory(path: Path) -> None:
-    if os.name != "posix":
-        return  # Windows file fsync is FlushFileBuffers; directory handles differ.
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def publish_object(directory: Path, sha256: str, data: bytes) -> bool:
-    """Return True for a new object; competing writers expose only complete files."""
-    path = directory / f"{sha256}.json"
-    with tempfile.NamedTemporaryFile(dir=directory, prefix=".obj-", delete=False) as stream:
-        temporary = Path(stream.name)
-        try:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-            stream.close()
-            try:
-                os.link(temporary, path)
-                return True
-            except FileExistsError:
-                if path.is_symlink() or read_object(path) != data:
-                    raise ValueError("existing pack cache object failed integrity") from None
-                return False
-        finally:
-            temporary.unlink(missing_ok=True)
-
-
-def decode(data: bytes):
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate pack object field")
-            result[key] = value
-        return result
-
-    def nonfinite(value):
-        raise ValueError("non-finite pack JSON value")
-
-    return json.loads(data, object_pairs_hook=unique, parse_constant=nonfinite)
-
-
-class PackReader:
-    def __init__(self, directory: Path):
-        self.directory = directory
-        self.reads = set()
-
-    def blob(self, reference: dict, depth: int = 0) -> bytes:
+class PackReader(NativePackReader):
+    def blob(self, reference: dict[str, Any], depth: int = 0) -> bytes:
         if not isinstance(reference, dict) or set(reference) != {"sha256", "length", "expanded_length", "kind"}:
             raise ValueError("invalid pack object reference")
         if (
@@ -129,10 +68,7 @@ class PackReader:
             raise ValueError("pack expansion length invalid")
         return b"".join(parts)
 
-    def json(self, reference: dict):
-        return decode(self.blob(reference))
-
-    def verify_release(self, root: dict, engine: str, identities: set[str]) -> None:
+    def verify_release(self, root: dict[str, Any], engine: str, identities: set[str]) -> None:
         if root.get("engine") != engine:
             raise ValueError("pack compiler does not match current native implementation")
         seen = set()

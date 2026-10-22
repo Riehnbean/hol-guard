@@ -1,13 +1,15 @@
-"""Integrity-bound policy availability lookup; never activates an extension."""
+"""Build-time integrity-bound policy availability lookup; never activates an extension."""
 
 from __future__ import annotations
 
 import hashlib
 
-from command_pack_store import MAX_OBJECT_BYTES, digest
-from extension_delivery_assets import location
 from extension_delivery_objects import read_index_page, validate_reference
-from extension_pack_archives import MAX_ARCHIVE_BYTES, MAX_PARTS
+
+from codex_plugin_scanner.guard.catalog_delivery.containers import location
+from codex_plugin_scanner.guard.catalog_delivery.object_native import sessioned
+from codex_plugin_scanner.guard.catalog_delivery.pack_archives import MAX_ARCHIVE_BYTES, MAX_PARTS
+from codex_plugin_scanner.guard.catalog_delivery.pack_store import MAX_OBJECT_BYTES, digest
 
 
 def validate_record(record, identity, manifest):
@@ -109,7 +111,8 @@ def read_transport_page(store, transport, expected, count, prefix):
     return wrapper, page
 
 
-def lookup(store, native_root, transport, identity):
+@sessioned
+def lookup(store, native_root, transport, identity, *, expected_reference=None):
     """Caller supplies one authenticated root; this checks its byte proofs only."""
     if not isinstance(identity, str) or not identity.isascii() or not 0 < len(identity) <= 256:
         raise ValueError("policy lookup identity invalid")
@@ -132,6 +135,8 @@ def lookup(store, native_root, transport, identity):
             if target is None:
                 return None
             reference = next(row[1] for row in wrapper["records"] if row[0] == identity)
+            if expected_reference is not None and reference != expected_reference:
+                raise ValueError("default policy reference differs from authenticated transport")
             return validate_record(store.json(reference), identity, target[1])
         selected = next((index for index, row in enumerate(page["children"]) if hashed.startswith(row[0])), None)
         if selected is None:

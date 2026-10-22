@@ -5,7 +5,7 @@ use super::*;
 use std::sync::Arc;
 
 use crate::hook_evidence_writer::{
-    CommandActivityRecord, ComposioActionSchema, ComposioWorkflowProposal,
+    CommandActivityRecord, ComposioActionSchema, ComposioWorkflowProposal, ObservedCliIdentity,
     ObservedMcpServerIdentity, ObservedMcpTool,
 };
 
@@ -13,10 +13,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let elapsed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let elapsed = crate::unique_nanos::unique_nanos();
         let path = std::env::temp_dir().join(format!(
             "hg-evidence-journal-{label}-{}-{elapsed}",
             std::process::id()
@@ -319,7 +316,14 @@ impl ComposioApi for OneDiscovery {
             || ObservedMcpTool {
                 harness: harness.to_owned(),
                 qualified_name: tool_name.to_owned(),
-                identity: "local-cli.mcp-test".to_owned(),
+                identity: ObservedCliIdentity {
+                    cli_id: "local-cli.mcp-test".to_owned(),
+                    name: "composio".to_owned(),
+                    kind: "executable".to_owned(),
+                    identity_hash: "0".repeat(64),
+                    example_label: "mcp__composio__".to_owned(),
+                    interpreter_name: None,
+                },
                 server: ObservedMcpServerIdentity {
                     identity_hash: "0".repeat(64),
                     command: None,

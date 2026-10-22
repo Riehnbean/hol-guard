@@ -19,8 +19,10 @@ from codex_plugin_scanner.guard.blocked_request_mode import SAFE_ALTERNATIVE_GUI
 from tests.gauntlet_replay import ReplayCase, expand, judge
 
 
-def _case(expect: str, harness: str = "claude-code") -> ReplayCase:
-    return ReplayCase(f"x@{harness}", "x", harness, "shell", {"command": "ls"}, "worktree", expect)
+def _case(expect: str, harness: str = "claude-code", contained_ok: bool = False) -> ReplayCase:
+    return ReplayCase(
+        f"x@{harness}", "x", harness, "shell", {"command": "ls"}, "worktree", expect, contained_ok=contained_ok
+    )
 
 
 _QUIET = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
@@ -63,16 +65,116 @@ def test_always_needs_a_persistent_allow_in_the_contract() -> None:
     assert judge(_case("always"), asked, [offered]) is None
 
 
+@pytest.mark.parametrize("base_id", ["find-exec-literal-interpreter-argument", "find-exec-escaped-regex-argument"])
+def test_named_find_cases_accept_quiet_work_in_the_replay(base_id: str) -> None:
+    case = next(case for case in expand() if case.base_id == base_id)
+    assert judge(case, _QUIET, []) is None
+
+
+def test_named_child_review_still_requires_always_allow() -> None:
+    asked = {"hookSpecificOutput": {"permissionDecision": "ask"}}
+    once = {"tool_name": "Bash", "always_available": False, "exact_context_token_present": True}
+    offered = {
+        "tool_name": "Bash",
+        "always_available": True,
+        "exact_action_persistence_eligible": True,
+        "exact_context_token_present": True,
+    }
+    case = _case("quiet_or_always")
+    assert judge(case, asked, [offered]) is None
+    assert judge(case, asked, [once]) is not None
+    assert judge(case, {"hookSpecificOutput": {"permissionDecision": "deny"}}, []) is not None
+    assert judge(case, {**_QUIET, "systemMessage": "Guard warning"}, []) is not None
+
+
 def test_attack_must_not_be_allowed() -> None:
     denied = {"hookSpecificOutput": {"permissionDecision": "deny"}}
     assert judge(_case("block"), _QUIET, []) is not None
     assert judge(_case("block"), denied, []) is None
 
 
+_ROUTED = {**_QUIET, "reason_code": "native_contained_execution_routed"}
+
+
+def test_containment_protects_only_the_case_that_says_so() -> None:
+    # The workspace sandbox still writes inside the workspace, so a contained run is not protection
+    # against an attack on the worktree itself. Only a case whose harm is network, home or
+    # credential reach counts it.
+    assert judge(_case("block"), _ROUTED, []) is not None
+    assert judge(_case("block", contained_ok=True), _ROUTED, []) is None
+
+
+def test_a_contained_omp_receipt_needs_the_same_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tests.gauntlet_replay.sys.platform", "darwin")
+    workspace = {
+        "decision": "deny",
+        "policy_action": "sandbox-required",
+        "reason_code": "native_workspace_containment_required",
+        "required_execution_profile": "workspace-contained-v1",
+    }
+    assert judge(_case("block", "omp"), workspace, []) is not None
+    assert judge(_case("block", "omp", contained_ok=True), workspace, []) is None
+
+
+def test_only_the_marked_cases_may_pass_on_containment() -> None:
+    marked = {c.base_id for c in expand() if c.expect == "block" and c.contained_ok}
+    assert marked == {
+        "neg-cargo-check-locked-host-toolchain",
+        # A filter whose grammar the read recognizer rejects: the operands stay inside the
+        # workspace, so the contained run reaches nothing, and the case pins the rejection
+        # rather than an approval prompt an in-worktree write would never raise.
+        "neg-cut-without-selection",
+        "neg-env-bare-set-then-list",
+        "neg-env-git-dir-then-list",
+        "neg-env-ld-preload-then-list",
+        "neg-env-pager-names-program",
+        # A pager option that carries its own shell escape: a contained run gives the
+        # escape nothing outside the workspace to reach.
+        "neg-env-pager-option-escape-export",
+        # A `find` that is not limited to regular files hands a link to `grep`, which opens its
+        # target; the contained run reaches nothing outside the workspace.
+        "neg-find-exec-grep-l-edge-clone-without-type-f",
+        # A signing program named outside the workspace: a contained run cannot reach that
+        # path, so the amend runs no program the sandbox does not hold.
+        "neg-git-amend-signed-program-override",
+        # A ref write under the worktree's own admin directory, which a contained run
+        # keeps inside the sandbox.
+        "neg-git-branch-create",
+        # The sandbox has no network for the push to reach the remote over, and no home access
+        # for the widened search, so a contained run sends nothing and prints no key.
+        "neg-git-push-to-tmp-chain",
+        # A listing below a hidden home directory: a contained run has no home access, so it
+        # names nothing the home keeps there.
+        "neg-ls-home-dot-glob",
+        "neg-ls-home-missing-hidden-store",
+        "neg-ls-home-missing-key-in-hidden-directory",
+        # A file listing of a home service lane or credential store: a contained run has no
+        # home access, so it prints no name the home keeps there.
+        "neg-rg-content-search-service-lane",
+        "neg-rg-files-hidden-service-lane",
+        "neg-rg-files-home-credential-store",
+        "neg-rg-files-no-ignore-service-lane",
+        "neg-rg-path-before-files-flag-credential-store",
+        "neg-rg-replace-widens-home-search",
+        # A sibling checkout's workflows and test runner: a contained run reads only the
+        # workspace, so `-exec cat`, a preloaded module or a dotfile probe reaches no secret.
+        "neg-sibling-find-github-exec-cat",
+        "neg-sibling-ls-missing-env-below-github",
+        "neg-sibling-node-heap-require-other-checkout",
+        # The same rejection for a filter that names an output file. `neg-sort-output-file`
+        # and `neg-uniq-output-operand` carry the strict direction with an escaping path;
+        # these keep the in-worktree shape on record, where the write cannot leave the
+        # workspace and the contained run is the designed outcome.
+        "neg-sort-output-file-in-worktree",
+        "neg-tr-file-operand",
+        "neg-uniq-output-operand-in-worktree",
+    }
+
+
 _SETUP_RESULT = {
     "policy_action": "block",
     "decision": "deny",
-    "reason": f"{connector_setup_reason('lanectl', 'cli', ask=False)} {SAFE_ALTERNATIVE_GUIDANCE}",
+    "reason": f"{connector_setup_reason('lanectl', 'cli', ask=False)} Review it at http://127.0.0.1:9/requests/r1.",
 }
 _SETUP_ROW = {
     "reason_code": "native_command_review_required",
@@ -88,6 +190,9 @@ def test_setup_needs_the_connector_outcome_not_a_generic_review() -> None:
     assert judge(_case("setup"), _SETUP_RESULT, [_SETUP_ROW, _SETUP_ROW]) is not None
     assert judge(_case("setup"), _SETUP_RESULT, [{**_SETUP_ROW, "reason_code": "native_policy_block"}]) is not None
     assert judge(_case("setup"), _QUIET, []) is not None
+    # A local CLI is approvable: sending the agent to a safe alternative instead of the approval is wrong.
+    redirected = {**_SETUP_RESULT, "reason": f"{_SETUP_RESULT['reason']} {SAFE_ALTERNATIVE_GUIDANCE}"}
+    assert "redirect the agent" in str(judge(_case("setup"), redirected, [_SETUP_ROW]))
 
 
 def test_a_setup_case_is_replayed_as_setup() -> None:

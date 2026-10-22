@@ -1,12 +1,15 @@
-"""Located metadata objects. Fetching establishes integrity, never authority."""
+"""Build-time located metadata objects.
 
-from __future__ import annotations
+Publishing and regeneration write and read these without the native runtime
+installed. The installed runtime walks the same references natively.
+"""
 
 import hashlib
 
 from command_pack_store import MAX_BLOB_BYTES, MAX_OBJECT_BYTES, PackReader, decode, digest, publish_object
-from extension_delivery_assets import location
-from extension_delivery_objects import ObjectStore, encoded
+
+from codex_plugin_scanner.guard.catalog_delivery.containers import location
+from codex_plugin_scanner.guard.catalog_delivery.metadata_objects import ObjectStore, encoded
 
 
 class LocatedStore(ObjectStore):

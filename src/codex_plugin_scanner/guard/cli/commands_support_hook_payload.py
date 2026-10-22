@@ -11,12 +11,11 @@ import logging
 import re
 import sqlite3
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 from ..native_hook_adapter import UnsupportedHarnessError
 from ..native_hook_render import native_evaluation_has_terminal_policy_action
-from .native_hook_exit_code import native_hook_verdict_exit_code
 
 
 def _coalesce_string(*values: object | None) -> str:
@@ -98,7 +97,6 @@ def _load_hook_payload(
     return payload
 
 _BLOCKING_ACTIONS = frozenset({"review", "require-reapproval", "sandbox-required", "block"})
-_NON_VERDICT_EVENTS = frozenset({"UserPromptSubmit", "Notification", "PermissionRequest", "PostToolUse"})
 
 
 def _render_cli(kind: str, harness: str, params: dict[str, object]) -> tuple[str, dict[str, object] | None] | None:
@@ -157,12 +155,6 @@ def _emit_native_hook_response(
     output_stream: TextIO | None = None,
 ) -> None:
     canonical = _canonical_harness_name(harness)
-    if canonical == "hermes" and event_name not in _NON_VERDICT_EVENTS:
-        from ..adapters.hermes_runtime_hooks import hermes_native_decision
-
-        decision = hermes_native_decision(policy_action=policy_action, reason=reason)
-        _write_json_line(decision, output_stream=output_stream)
-        return
     params: dict[str, object] = {
         "canonical_harness": canonical,
         "event_name": event_name,
@@ -188,6 +180,16 @@ def _emit_native_hook_response(
         _write_json_line(document, output_stream=output_stream)
 
 
+def _native_edge_output_masked(native_edge_result: Mapping[str, object]) -> bool:
+    """Whether the edge withheld this output from the model.
+
+    The edge answers this itself. A reply that carries no answer is a shape
+    this build cannot read, so the output stays withheld.
+    """
+    masked = native_edge_result.get("output_masked")
+    return masked if isinstance(masked, bool) else True
+
+
 def _apply_native_edge_envelope_fields(
     response_payload: dict[str, object],
     native_edge_result: Mapping[str, object] | None,
@@ -205,8 +207,12 @@ def _apply_native_edge_envelope_fields(
     edge_decision = native_edge_result.get("decision")
     if isinstance(edge_decision, str) and edge_decision.strip():
         response_payload["native_edge_decision"] = edge_decision
-        if project_decision:
-            response_payload["decision"] = "block" if edge_decision == "deny" else "allow"
+    if project_decision:
+        # Only an output review answers whether the model may read the output,
+        # and only its callers project a harness verdict from the edge.
+        masked = _native_edge_output_masked(native_edge_result)
+        response_payload["native_edge_output_masked"] = masked
+        response_payload["decision"] = "block" if masked else "allow"
     structured_content_mediation = native_edge_result.get("structured_content_mediation")
     if isinstance(structured_content_mediation, Mapping):
         # The worker already produced the validated mediation contract. Keep
@@ -267,18 +273,22 @@ def _restore_ephemeral_approval_tokens(value: object, tokens: list[str]) -> obje
 def _emit_native_post_tool_envelope(
     harness: str,
     *,
-    policy_action: str,
+    blocking: bool,
     reason: str,
     response_payload: dict[str, object],
     output_stream: TextIO | None = None,
     as_json: bool = False,
 ) -> None:
-    """Emit a PostToolUse outcome; the action already ran so it never pauses."""
-    blocking = policy_action in {"review", "require-reapproval", "sandbox-required", "block"}
-    edge_masked = (
-        response_payload.get("native_edge_decision") == "deny"
-        or response_payload.get("model_output_action") == "block"
-    )
+    """Emit a PostToolUse outcome; the action already ran so it never pauses.
+
+    ``blocking`` is the caller's already-settled verdict, never re-derived here.
+    A caller holding a native directive passes its ``envelope_decision`` so the
+    emitted surface carries the Rust verdict verbatim.
+    """
+    # The edge decided whether this output is withheld; nothing here re-reads
+    # its verdict or its output action to decide that again. An event with no
+    # edge review carries no mask.
+    edge_masked = response_payload.get("native_edge_output_masked") is True
     response_payload["continue"] = True
     # ``decision`` mirrors the composed policy outcome for the bridge surface;
     # ``native_edge_decision`` keeps the raw edge mask verdict as provenance.
@@ -320,6 +330,7 @@ def _native_hook_json_document(
     *,
     event_name: str,
     policy_action: str,
+    exit_code: Callable[[], int],
     reason: str,
     envelope: Mapping[str, object] | None,
     system_message: str | None = None,
@@ -333,7 +344,11 @@ def _native_hook_json_document(
 
     Returns ``(document, rc)`` when this call owns the response, ``(None, 0)``
     when the harness contract is silence, and ``None`` when the caller should
-    fall back to the generic envelope or adapter emit paths.
+    fall back to the generic envelope or adapter emit paths. ``exit_code`` is
+    the status the resident's directive already decided for this verdict, so
+    the document and the process status come from the same decision; it is
+    asked for only on a branch that owns the response, because grok reads its
+    own status from the adapter's emit state.
     """
     if not getattr(args, "json", False) or event_name == "PostToolUse":
         return None
@@ -354,14 +369,13 @@ def _native_hook_json_document(
         "verified_benign": verified_benign,
     }
     rendered = _render_cli("cli_document", args.harness, params)
-    exit_code = native_hook_verdict_exit_code(canonical, policy_action, event_name)
     if rendered is None:
         denied = _fixed_deny(args.harness, event_name, policy_action, reason)
-        return (denied, exit_code) if denied is not None else None
+        return (denied, exit_code()) if denied is not None else None
     outcome, document = rendered
     if outcome == "fallback":
         return None
-    return (document if outcome == "document" else None), exit_code
+    return (document if outcome == "document" else None), exit_code()
 
 
 def _emit_native_hook_json_document(

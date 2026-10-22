@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -40,6 +40,27 @@ class StoreLocalMcpMixin:
             connection.execute("begin")
             ensure_local_cli_schema(connection, for_read=True)
             return read_native_provider_choices(connection)
+
+    def observed_mcp_history(self, *, limit: int) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Return the paused requests and receipts the connector scan reads.
+
+        The resident projects each row to the tool label, the harness and the
+        history timestamps, which is all the scan parses. Asking for whole
+        approval rows and whole receipts encoded a store with a few hundred of
+        either past the native response cap, and the refresh then failed
+        instead of discovering connectors.
+        """
+
+        page = self._native_store_call("observed_mcp_history", {"limit": limit})
+        if not isinstance(page, dict):
+            raise sqlite3.DatabaseError("native_observed_mcp_history_invalid")
+        batches: list[list[dict[str, object]]] = []
+        for key in ("approvals", "receipts"):
+            rows = cast(dict[str, object], page).get(key)
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise sqlite3.DatabaseError("native_observed_mcp_history_invalid")
+            batches.append(cast("list[dict[str, object]]", rows))
+        return batches[0], batches[1]
 
     def read_observed_mcp_tool_actions(self) -> dict[str, str]:
         """Return the operator's exact choices for observed MCP connectors."""
@@ -283,6 +304,21 @@ class StoreLocalMcpMixin:
         if not isinstance(cli_id, str):
             raise sqlite3.DatabaseError("native_local_mcp_observation_invalid")
         return cli_id
+
+    def reconcile_remote_mcp_declarations(self, *, harnesses: Sequence[str], declared_cli_ids: Sequence[str]) -> int:
+        """Forget remote declarations a config scan of ``harnesses`` no longer finds.
+
+        Records stay, so permission history and decisions are kept; only the
+        ``<harness>:remote`` source goes, and the stored origin once no harness
+        declares the connector as remote.
+        """
+
+        result = self._native_store_call(
+            "reconcile_remote_mcp_declarations",
+            {"harnesses": sorted(set(harnesses)), "declared_cli_ids": sorted(set(declared_cli_ids))},
+        )
+        reconciled = result.get("reconciled") if isinstance(result, dict) else None
+        return reconciled if isinstance(reconciled, int) else 0
 
 
 @contextmanager

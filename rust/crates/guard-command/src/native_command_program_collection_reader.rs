@@ -11,6 +11,18 @@ pub struct PackAdmissionBudget {
     pub nodes: usize,
 }
 
+impl PackAdmissionBudget {
+    /// Resident control-path limits. These do not alter any legacy format cap.
+    pub const fn resident() -> Self {
+        Self {
+            packs: 32768,
+            program_bytes: 512 * 1024 * 1024,
+            rules: 131072,
+            nodes: 1048576,
+        }
+    }
+}
+
 fn charge(remaining: &mut usize, amount: usize) -> Result<(), &'static str> {
     *remaining = remaining
         .checked_sub(amount)
@@ -27,8 +39,19 @@ impl NativeCommandProgram {
         root: &[u8],
         expected_root: &str,
         selected: &BTreeSet<String>,
+        budget: PackAdmissionBudget,
+        fetch: impl FnMut(&str) -> Result<Vec<u8>, &'static str>,
+    ) -> Result<Self, &'static str> {
+        Self::from_integrity_bound_packs_catalog(root, expected_root, selected, budget, fetch, None)
+    }
+
+    pub(super) fn from_integrity_bound_packs_catalog(
+        root: &[u8],
+        expected_root: &str,
+        selected: &BTreeSet<String>,
         mut budget: PackAdmissionBudget,
         fetch: impl FnMut(&str) -> Result<Vec<u8>, &'static str>,
+        mut catalog: Option<&mut Vec<crate::native_command_catalog::CatalogExtension>>,
     ) -> Result<Self, &'static str> {
         if selected.is_empty() || selected.iter().any(|id| !bounded_id(id)) {
             return Err("native_command_pack_selection_invalid");
@@ -40,6 +63,17 @@ impl NativeCommandProgram {
             let value = reader
                 .read(id, None)?
                 .ok_or("native_command_pack_selection_missing")?;
+            if let Some(catalog) = catalog.as_mut() {
+                let bytes = canonical_json_bytes(&value.catalog)
+                    .map_err(|_| "command_catalog_decode_failed")?;
+                charge(&mut budget.program_bytes, bytes.len())?;
+                let entries: Vec<crate::native_command_catalog::CatalogExtension> =
+                    serde_json::from_slice(&bytes).map_err(|_| "command_catalog_decode_failed")?;
+                if entries.len() != 1 || entries[0].extension_id != *id {
+                    return Err("native_command_pack_inventory_invalid");
+                }
+                catalog.extend(entries);
+            }
             let extensions = value.program["extensions"]
                 .as_array()
                 .filter(|extensions| extensions.len() == 1)

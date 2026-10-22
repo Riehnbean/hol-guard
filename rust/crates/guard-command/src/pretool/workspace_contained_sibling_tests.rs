@@ -233,6 +233,9 @@ fn a_list_after_cd_into_a_sibling_root_runs_contained_there() {
         format!("cd {} && npm run build && ls dist", tree.display()),
         // A removal is contained there exactly as it is in the session's own root.
         format!("cd {} && ls && rm notes.txt", tree.display()),
+        // Git in a linked worktree is bounded as it is in the root itself: the
+        // sink grants the shared Git directory the worktree's index lives in.
+        format!("cd {} && git add -A && git status", tree.display()),
         format!(
             "cd {} && npm run build && cat package.json",
             other.display()
@@ -292,10 +295,6 @@ fn a_sibling_cd_the_sink_would_not_rebase_keeps_its_review() {
         format!("cd {}/plain; npm run build", projects.display()),
         format!("cd {}/plain 2>/dev/null; npm run build", projects.display()),
         // The rest still faces every check it would from that root.
-        format!(
-            "cd {}/app-report && git add -A && git status",
-            projects.display()
-        ),
         format!(
             "cd {}/app-report && npm run build && curl https://example.com",
             projects.display()
@@ -559,6 +558,11 @@ fn a_script_in_a_sibling_repository_runs_contained_from_its_root() {
             "bun {0}/node_modules/vite/bin/vite.js build --root {0}",
             other.display()
         ),
+        // A heap size ahead of the script leaves the script as the program.
+        format!(
+            "node --max-old-space-size=4096 {}/node_modules/vite/bin/vite.js build",
+            other.display()
+        ),
     ] {
         assert_eq!(
             contained(&reason("omp", &home, &main, &command)),
@@ -584,6 +588,11 @@ fn a_script_outside_a_sibling_repository_keeps_its_review() {
         format!("jq . {}/package.json", tree.display()),
         format!("rg -n report {}/scripts", tree.display()),
         format!("python3 -c 1 {}", script.display()),
+        format!(
+            "node --max-old-space-size=4096 {}/node_modules/vite/bin/vite.js {}/probe.py",
+            tree.parent().unwrap().join("other").display(),
+            loose.display()
+        ),
     ] {
         assert!(
             !contained(&reason("omp", &home, &main, &command)),
